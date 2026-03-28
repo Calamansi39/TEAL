@@ -214,11 +214,39 @@ def get_sparse_model(model_name, device, histogram_path, **kwargs):
 
     SparseModel = LlamaSparseForCausalLM if "Llama" in class_name else MistralSparseForCausalLM
 
+    dtype = kwargs.pop("dtype", torch.float16)
+    if isinstance(dtype, str):
+        dtype_key = dtype.lower()
+        if dtype_key in ["fp16", "float16", "half"]:
+            dtype = torch.float16
+        elif dtype_key in ["bf16", "bfloat16"]:
+            dtype = torch.bfloat16
+        elif dtype_key in ["fp32", "float32"]:
+            dtype = torch.float32
+        else:
+            raise ValueError(f"Unsupported dtype: {dtype}")
+
+    attn_implementation = kwargs.pop("attn_implementation", "flash_attention_2")
+
     if device == 'auto':
         # multi gpu
-        return SparseModel.from_pretrained(model_name, torch_dtype=torch.float16, device_map="auto", attn_implementation="flash_attention_2", histogram_path=histogram_path, **kwargs)
+        return SparseModel.from_pretrained(
+            model_name,
+            torch_dtype=dtype,
+            device_map="auto",
+            attn_implementation=attn_implementation,
+            histogram_path=histogram_path,
+            **kwargs,
+        )
     else:
-        return SparseModel.from_pretrained(model_name, torch_dtype=torch.float16, device_map=device, attn_implementation="flash_attention_2", histogram_path=histogram_path, **kwargs)
+        return SparseModel.from_pretrained(
+            model_name,
+            torch_dtype=dtype,
+            device_map=device,
+            attn_implementation=attn_implementation,
+            histogram_path=histogram_path,
+            **kwargs,
+        )
 
 def get_tokenizer(tokenizer_name):
     tokenizer = transformers.AutoTokenizer.from_pretrained(

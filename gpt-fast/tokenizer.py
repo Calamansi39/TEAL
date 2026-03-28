@@ -94,6 +94,40 @@ class TiktokenWrapper(TokenizerInterface):
     def eos_id(self):
         return self._eos_id
 
+
+class HFTokenizerWrapper(TokenizerInterface):
+    def __init__(self, model_path):
+        super().__init__(model_path)
+        from transformers import AutoTokenizer
+
+        path = Path(model_path)
+        src = path.parent if path.is_file() else path
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            str(src), use_fast=True, trust_remote_code=True
+        )
+
+        if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+        self._bos_id = self.tokenizer.bos_token_id
+        self._eos_id = self.tokenizer.eos_token_id
+
+        if self._bos_id is None:
+            self._bos_id = self._eos_id
+
+    def encode(self, text):
+        return self.tokenizer.encode(text, add_special_tokens=False)
+
+    def decode(self, tokens):
+        return self.tokenizer.decode(tokens, skip_special_tokens=False)
+
+    def bos_id(self):
+        return self._bos_id
+
+    def eos_id(self):
+        return self._eos_id
+
+
 def get_tokenizer(tokenizer_model_path, model_name):
     """
     Factory function to get the appropriate tokenizer based on the model name.
@@ -106,7 +140,18 @@ def get_tokenizer(tokenizer_model_path, model_name):
     - TokenizerInterface: An instance of a tokenizer.
     """
 
+    path = Path(tokenizer_model_path)
+
     if "llama-3" in str(model_name).lower():
-        return TiktokenWrapper(tokenizer_model_path)
+        if path.is_file():
+            if path.name == "tokenizer.model":
+                return TiktokenWrapper(path)
+            return HFTokenizerWrapper(path)
+
+        tokenizer_json = path.parent / "tokenizer.json"
+        if tokenizer_json.is_file():
+            return HFTokenizerWrapper(tokenizer_json)
+
+        raise FileNotFoundError(f"Tokenizer file not found for llama-3: {path}")
     else:
         return SentencePieceWrapper(tokenizer_model_path)

@@ -371,6 +371,8 @@ def main(
     assert checkpoint_path.is_file(), checkpoint_path
 
     tokenizer_path = checkpoint_path.parent / "tokenizer.model"
+    if not tokenizer_path.is_file():
+        tokenizer_path = checkpoint_path.parent / "tokenizer.json"
     assert tokenizer_path.is_file(), str(tokenizer_path)
 
     global print

@@ -32,7 +32,7 @@ from generate import _load_model, encode_tokens, model_forward
 
 if lm_eval_available:
     try: # lm_eval version 0.4
-        from lm_eval.models.huggingface import HFLM as eval_wrapper
+        from lm_eval.api.model import TemplateLM as eval_wrapper
         from lm_eval.tasks import get_task_dict
         from lm_eval.evaluator import evaluate
     except: #lm_eval version 0.3
@@ -147,8 +147,79 @@ class GPTFastEvalWrapper(eval_wrapper):
         logits = model_forward(self._model, x, input_pos)
         return logits
 
-    def _model_generate(self, context, max_length, eos_token_id):
-        raise Exception('unimplemented')
+    def _score_continuation(self, context_enc, continuation_enc):
+        if len(continuation_enc) == 0:
+            return 0.0, True
+
+        if len(context_enc) == 0:
+            context_enc = [self.eot_token_id]
+
+        full_tokens = context_enc + continuation_enc
+        cont_start = len(context_enc)
+
+        if len(full_tokens) > self.max_length:
+            full_tokens = full_tokens[-self.max_length :]
+            cont_start = max(0, self.max_length - len(continuation_enc))
+
+        # Need one token to predict the first continuation token.
+        if cont_start == 0:
+            full_tokens = [self.eot_token_id] + full_tokens
+            cont_start = 1
+
+        input_ids = torch.tensor(full_tokens, dtype=torch.long, device=self._device).unsqueeze(0)
+        logits = self._model_call(input_ids)  # [1, T, V]
+
+        start = cont_start - 1
+        available = logits.shape[1] - start
+        if available <= 0:
+            return float("-inf"), False
+
+        target = torch.tensor(
+            continuation_enc[:available], dtype=torch.long, device=logits.device
+        )
+        cont_logits = logits[0, start : start + target.numel(), :]
+        log_probs = cont_logits.log_softmax(dim=-1)
+        token_log_probs = log_probs.gather(1, target.unsqueeze(1)).squeeze(1)
+
+        greedy = cont_logits.argmax(dim=-1)
+        is_greedy = bool(torch.equal(greedy, target))
+        return token_log_probs.sum().item(), is_greedy
+
+    def _loglikelihood_tokens(self, requests, **kwargs):
+        results = []
+        for req in requests:
+            if hasattr(req, "args"):
+                req = req.args
+
+            if isinstance(req, tuple) and len(req) >= 3:
+                _, context_enc, continuation_enc = req[0], req[1], req[2]
+            else:
+                raise ValueError(f"Unsupported request format for _loglikelihood_tokens: {type(req)}")
+
+            ll, is_greedy = self._score_continuation(context_enc, continuation_enc)
+            results.append((ll, is_greedy))
+
+        return results
+
+    def loglikelihood_rolling(self, requests, disable_tqdm: bool = False):
+        # Generative tasks are unsupported in this repo; keep a simple implementation
+        # to satisfy lm-eval's TemplateLM interface.
+        results = []
+        for req in requests:
+            args = req.args if hasattr(req, "args") else req
+            text = args[0]
+            toks = self.tok_encode(text)
+            if len(toks) == 0:
+                results.append(0.0)
+                continue
+            ll, _ = self._score_continuation([], toks)
+            results.append(ll)
+        return results
+
+    def generate_until(self, requests, disable_tqdm: bool = False):
+        # gpt-fast in this repo does not support lm-eval generative tasks.
+        # Returning empty generations keeps multiple-choice benchmarks functional.
+        return ["" for _ in requests]
 
 
 @torch.no_grad()
@@ -217,6 +288,8 @@ def main(
     assert checkpoint_path.is_file(), checkpoint_path
 
     tokenizer_path = checkpoint_path.parent / "tokenizer.model"
+    if not tokenizer_path.is_file():
+        tokenizer_path = checkpoint_path.parent / "tokenizer.json"
     assert tokenizer_path.is_file(), str(tokenizer_path)
 
     device = 'cuda'
@@ -224,7 +297,7 @@ def main(
 
     print("Loading model ...")
     t0 = time.time()
-    model = _load_model(checkpoint_path, device, precision, False)
+    model = _load_model(checkpoint_path, device, precision, False, None, 0.0)
 
     torch.cuda.synchronize()
     print(f"Time to load model: {time.time() - t0:.02f} seconds.")

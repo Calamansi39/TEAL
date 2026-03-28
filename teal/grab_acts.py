@@ -32,10 +32,19 @@ AutoModelForCausalLM.register(MistralSparseConfig, MistralSparseForCausalLM)
 parser = argparse.ArgumentParser(description="Parse command line arguments for the script.")
 parser.add_argument('--model_name', type=str, default="meta-llama/Llama-2-7b-hf",help='Name of the model to use')
 parser.add_argument('--output_path', type=str, required=True,help='Path to the output') # contains 1. model itself, 2. histograms, 3. activations
+parser.add_argument('--dtype', type=str, default='float16', help='Model dtype: float16/bfloat16/float32')
+parser.add_argument('--attn_implementation', type=str, default='flash_attention_2', help='Attention implementation')
 args = parser.parse_args()
 
 tokenizer = get_tokenizer(args.model_name)
-model = get_sparse_model(args.model_name, device="auto", histogram_path=os.path.join(args.output_path, "histograms"), grab_acts=True)
+model = get_sparse_model(
+    args.model_name,
+    device="auto",
+    histogram_path=os.path.join(args.output_path, "histograms"),
+    grab_acts=True,
+    dtype=args.dtype,
+    attn_implementation=args.attn_implementation,
+)
 
 from utils.data import get_dataset
 from tqdm import tqdm
