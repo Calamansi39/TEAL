@@ -12,8 +12,10 @@ import torch.nn as nn
 
 from transformers.models.llama.modeling_llama import (
     apply_rotary_pos_emb,
+    repeat_kv,
 )
 
+from utils.linear_input_stats import record_linear_input_stats
 from utils.utils import ActivationModule, Distribution, SparsifyFn, get_module_device
 
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
@@ -25,6 +27,8 @@ def _monkeypatch_self_attn(self_attn, file_path, grabbing_mode=False):
 
     self_attn.file_path = file_path
     self_attn.grabbing_mode = grabbing_mode
+    self_attn.arc_quant_bridge = None
+    self_attn.layer_idx = None
 
     if not grabbing_mode:
         self_attn.distrs = {}
@@ -52,6 +56,7 @@ def _FA2_forward(
     output_attentions = False, #: bool = False,
     use_cache = False, #: bool = False,
     cache_position = None, #: Optional[torch.LongTensor] = None,
+    position_embeddings = None,
     activation_module = None,
     **kwargs,
 ): # -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
@@ -78,19 +83,44 @@ def _FA2_forward(
 
         x_k = self.sparse_fns['k'](hidden_states)
         x_v = self.sparse_fns['v'](hidden_states)
-
-        query_states = self.q_proj(x_q)
-        key_states = self.k_proj(x_k)
-        value_states = self.v_proj(x_v)
+        record_linear_input_stats(f"layer_{self.layer_idx}.q", x_q)
+        record_linear_input_stats(f"layer_{self.layer_idx}.k", x_k)
+        record_linear_input_stats(f"layer_{self.layer_idx}.v", x_v)
+        q_key = f"layers.{self.layer_idx}.self_attn.q_proj.input"
+        k_key = f"layers.{self.layer_idx}.self_attn.k_proj.input"
+        v_key = f"layers.{self.layer_idx}.self_attn.v_proj.input"
+        if self.arc_quant_bridge is not None:
+            query_states = self.arc_quant_bridge.linear(x_q, self.q_proj.weight, self.q_proj.bias, q_key)
+            key_states = self.arc_quant_bridge.linear(x_k, self.k_proj.weight, self.k_proj.bias, k_key)
+            value_states = self.arc_quant_bridge.linear(x_v, self.v_proj.weight, self.v_proj.bias, v_key)
+        else:
+            query_states = self.q_proj(x_q)
+            key_states = self.k_proj(x_k)
+            value_states = self.v_proj(x_v)
         
+    num_heads = getattr(self, "num_heads", getattr(self.config, "num_attention_heads"))
+    num_key_value_heads = getattr(
+        self,
+        "num_key_value_heads",
+        getattr(self.config, "num_key_value_heads", num_heads),
+    )
+    num_key_value_groups = getattr(
+        self,
+        "num_key_value_groups",
+        max(num_heads // num_key_value_heads, 1),
+    )
+
     # Flash attention requires the input to have the shape
     # batch_size x seq_length x head_dim x hidden_dim
     # therefore we just need to keep the original shape
-    query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-    key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-    value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+    query_states = query_states.view(bsz, q_len, num_heads, self.head_dim).transpose(1, 2)
+    key_states = key_states.view(bsz, q_len, num_key_value_heads, self.head_dim).transpose(1, 2)
+    value_states = value_states.view(bsz, q_len, num_key_value_heads, self.head_dim).transpose(1, 2)
 
-    cos, sin = self.rotary_emb(value_states, position_ids)
+    if position_embeddings is not None:
+        cos, sin = position_embeddings
+    else:
+        cos, sin = self.rotary_emb(value_states, position_ids)
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
 
@@ -98,12 +128,6 @@ def _FA2_forward(
         # sin and cos are specific to RoPE models; cache_position needed for the static cache
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
         key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-    # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
-    # to be able to avoid many of these transpose/reshape/view.
-    query_states = query_states.transpose(1, 2)
-    key_states = key_states.transpose(1, 2)
-    value_states = value_states.transpose(1, 2)
 
     dropout_rate = self.attention_dropout if self.training else 0.0
 
@@ -134,13 +158,38 @@ def _FA2_forward(
         key_states = key_states.to(target_dtype)
         value_states = value_states.to(target_dtype)
 
-    # NOTE: sliding window isn't tested for Mistral, please create an issue if something goes wrong
-    # However, we don't ever utilize sequence lengths of more than 4096 for the methodology + evals
-    attn_output = _flash_attention_forward(
-        query_states, key_states, value_states, attention_mask, q_len, position_ids=position_ids, dropout=dropout_rate, sliding_window=getattr(self, "sliding_window", None), is_causal=True
-    )
-
-    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+    use_flash = getattr(self.config, "_attn_implementation", None) == "flash_attention_2"
+    if use_flash:
+        # Flash Attention expects [batch, seq, heads, dim].
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+        # NOTE: sliding window isn't tested for Mistral, please create an issue if something goes wrong
+        # However, we don't ever utilize sequence lengths of more than 4096 for the methodology + evals
+        attn_output = _flash_attention_forward(
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            q_len,
+            position_ids=position_ids,
+            dropout=dropout_rate,
+            sliding_window=getattr(self, "sliding_window", None),
+            is_causal=True,
+        )
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+    else:
+        key_states = repeat_kv(key_states, num_key_value_groups)
+        value_states = repeat_kv(value_states, num_key_value_groups)
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=attention_mask,
+            dropout_p=dropout_rate,
+            is_causal=attention_mask is None and q_len > 1,
+        )
+        attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size).contiguous()
 
     # MONKEYPATCH HERE
     if self.grabbing_mode:
@@ -148,7 +197,12 @@ def _FA2_forward(
         attn_output = self.o_proj(attn_output)
     else:
         attn_output = self.sparse_fns['o'](attn_output)
-        attn_output = self.o_proj(attn_output)
+        record_linear_input_stats(f"layer_{self.layer_idx}.o", attn_output)
+        o_key = f"layers.{self.layer_idx}.self_attn.o_proj.input"
+        if self.arc_quant_bridge is not None:
+            attn_output = self.arc_quant_bridge.linear(attn_output, self.o_proj.weight, self.o_proj.bias, o_key)
+        else:
+            attn_output = self.o_proj(attn_output)
 
     if not output_attentions:
         attn_weights = None

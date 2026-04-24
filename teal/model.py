@@ -53,7 +53,7 @@ class SparseModelMixin:
         uniform_sparsity = kwargs.pop('uniform_sparsity', None)
         mlp_sparsity = kwargs.pop('mlp_sparsity', None)
         self_attn_sparsity = kwargs.pop('self_attn_sparsity', None)
-        apply_prefill = kwargs.pop('apply_prefill', True)
+        protect_prefill = kwargs.pop('protect_prefill', kwargs.pop('apply_prefill', True))
 
         # Load the config
         config = kwargs.get('config', None)
@@ -88,7 +88,7 @@ class SparseModelMixin:
             model.reset_sparsities()
 
         if not grab_acts:
-            model.set_apply_prefill(apply_prefill)
+            model.set_prefill_protection(protect_prefill)
 
         return model
 
@@ -97,12 +97,22 @@ class SparseModelMixin:
             layer.mlp.grabbing_mode = mode
             layer.self_attn.grabbing_mode = mode
 
-    def set_apply_prefill(self, apply_prefill):
+    def set_prefill_protection(self, protect_prefill):
         for layer in self.model.layers:
             for proj in ['q', 'k', 'v', 'o']:
-                layer.self_attn.sparse_fns[proj].apply_prefill = apply_prefill
+                layer.self_attn.sparse_fns[proj].protect_prefill = protect_prefill
             for proj in ['gate', 'up', 'down']:
-                layer.mlp.sparse_fns[proj].apply_prefill = apply_prefill
+                layer.mlp.sparse_fns[proj].protect_prefill = protect_prefill
+
+    def set_apply_prefill(self, apply_prefill):
+        self.set_prefill_protection(apply_prefill)
+
+    def set_arc_quant_bridge(self, bridge):
+        for layer_idx, layer in enumerate(self.model.layers):
+            layer.mlp.arc_quant_bridge = bridge
+            layer.mlp.layer_idx = layer_idx
+            layer.self_attn.arc_quant_bridge = bridge
+            layer.self_attn.layer_idx = layer_idx
 
 
     def build_sparse_layers(self, histogram_path, grab_acts):
@@ -113,7 +123,10 @@ class SparseModelMixin:
 
         for i, layer in enumerate(self.model.layers):
             if isinstance(layer, LlamaDecoderLayer) or isinstance(layer, MistralDecoderLayer):
-                layers.append(_monkeypatch_layer(layer, path=f"{histogram_path}/layer-{i}", grabbing_mode=grab_acts))
+                patched = _monkeypatch_layer(layer, path=f"{histogram_path}/layer-{i}", grabbing_mode=grab_acts)
+                patched.mlp.layer_idx = i
+                patched.self_attn.layer_idx = i
+                layers.append(patched)
             else:
                 raise ValueError(f"Unknown layer type: {type(layer)}")
         

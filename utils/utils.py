@@ -6,6 +6,21 @@ from collections import defaultdict
 
 import os
 
+def resolve_local_model_path(model_name):
+    if os.path.isdir(model_name):
+        return model_name
+    cache_root = os.path.expanduser("~/.cache/huggingface/hub")
+    repo_dir = os.path.join(cache_root, f"models--{model_name.replace('/', '--')}")
+    ref_file = os.path.join(repo_dir, "refs", "main")
+    snapshots_dir = os.path.join(repo_dir, "snapshots")
+    if os.path.isfile(ref_file) and os.path.isdir(snapshots_dir):
+        with open(ref_file) as f:
+            snapshot = f.read().strip()
+        snapshot_dir = os.path.join(snapshots_dir, snapshot)
+        if os.path.isdir(snapshot_dir):
+            return snapshot_dir
+    return model_name
+
 class SparsifyFn(nn.Module):
     def __init__(self, distr, init_sparsity=None,init_threshold=None, apply_prefill=True):
         super(SparsifyFn, self).__init__()
@@ -23,7 +38,7 @@ class SparsifyFn(nn.Module):
         self.register_buffer("a", torch.tensor([thresh]).to(torch.float16))
 
         self.distr = distr
-        self.apply_prefill = apply_prefill
+        self.protect_prefill = bool(apply_prefill)
 
     def set_threshold(self, sparsity):
         self.threshold = self.distr.icdf(0.5 + sparsity/2).item() if sparsity != 0.0 else 0.0
@@ -31,9 +46,9 @@ class SparsifyFn(nn.Module):
 
     def forward(self, x):
 
-        # NOTE: we can + should change this to sparsify 99% of tokens instead of 50%
-        # I just finished the evals for the paper at 50% before I noticed the prefill sparsification phenomenon (Section 5.4.3)
-        if x.size(1) > 1 and self.apply_prefill:
+        # NOTE: with prefill protection enabled, only sparsify the latter half of
+        # the prefill tokens. When disabled, sparsify the entire prefill chunk.
+        if x.size(1) > 1 and self.protect_prefill:
             half_seq_len = x.size(1) // 2
             # half_seq_len = int(0.99 * x.size(1))
             last_context = x[:, -half_seq_len:, :]
@@ -42,8 +57,8 @@ class SparsifyFn(nn.Module):
             x = torch.cat((x[:, :-half_seq_len, :], modified_context), dim=1)
             return x
         
-        if x.size(1) > 1 and not self.apply_prefill:
-            return x
+        if x.size(1) > 1:
+            return self.apply(x)
 
         assert x.size(1) == 1, "supposedly x is decode only"
         return self.apply(x)
@@ -152,14 +167,11 @@ class ActivationModule:
         
         torch.cuda.empty_cache()
         for key, acts in self.activations.items():
-
-            acts = acts.flatten().detach().to('cuda')
+            acts = acts.flatten().detach().float().cpu()
             acts = torch.sort(acts)[0]
 
             lower_bound = acts[int(outlier_threshold * len(acts))]
             upper_bound = acts[-int(outlier_threshold * len(acts))]
-
-            acts = acts.cpu()
 
             main_bins = torch.linspace(lower_bound, upper_bound, num_bins - 1)
             bins = torch.cat([torch.tensor([acts[0]]), main_bins, torch.tensor([acts[-1]])])
@@ -185,6 +197,7 @@ class ActivationModule:
 from transformers import AutoConfig
 
 def get_model_class_name(model_name):
+    model_name = resolve_local_model_path(model_name)
     try:
         # Fetch the model config
         config = AutoConfig.from_pretrained(model_name)
@@ -199,6 +212,7 @@ def get_model_class_name(model_name):
 
 
 def get_sparse_model(model_name, device, histogram_path, **kwargs):
+    model_name = resolve_local_model_path(model_name)
     from teal.model import LlamaSparseForCausalLM, MistralSparseForCausalLM, LlamaSparseConfig, MistralSparseConfig
 
     from transformers import AutoConfig, AutoModelForCausalLM
@@ -249,9 +263,18 @@ def get_sparse_model(model_name, device, histogram_path, **kwargs):
         )
 
 def get_tokenizer(tokenizer_name):
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        tokenizer_name, use_fast=True, trust_remote_code=True
-    )
+    tokenizer_name = resolve_local_model_path(tokenizer_name)
+    try:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            tokenizer_name,
+            use_fast=False,
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+    except Exception:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            tokenizer_name, use_fast=False, trust_remote_code=True
+        )
 
     if tokenizer.pad_token_id is None:
         if tokenizer.eos_token_id is not None:

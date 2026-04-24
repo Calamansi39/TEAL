@@ -34,6 +34,10 @@ parser.add_argument('--model_name', type=str, default="meta-llama/Llama-2-7b-hf"
 parser.add_argument('--output_path', type=str, required=True,help='Path to the output') # contains 1. model itself, 2. histograms, 3. activations
 parser.add_argument('--dtype', type=str, default='float16', help='Model dtype: float16/bfloat16/float32')
 parser.add_argument('--attn_implementation', type=str, default='flash_attention_2', help='Attention implementation')
+parser.add_argument('--dataset_name', type=str, default='wikitext', help='Calibration dataset name')
+parser.add_argument('--subset', type=str, default='wikitext-2-raw-v1', help='Calibration dataset subset/config')
+parser.add_argument('--split', type=str, default='train', help='Calibration dataset split')
+parser.add_argument('--size', type=int, default=300, help='Number of streamed calibration samples')
 args = parser.parse_args()
 
 tokenizer = get_tokenizer(args.model_name)
@@ -52,10 +56,10 @@ import gc
 
 # build histograms
 dataset = get_dataset(
-    "tatsu-lab/alpaca",
-    subset=None,
-    split="train",
-    size=300
+    args.dataset_name,
+    subset=None if args.subset in [None, "None", "none", ""] else args.subset,
+    split=args.split,
+    size=args.size,
 )
 text = ""
 for sample in tqdm(dataset):
@@ -66,39 +70,53 @@ bsz, seq_len = 10, 2048
 
 encodings = tokenizer(text, truncation=True, return_tensors="pt", max_length=seq_len, return_overflowing_tokens=True, padding="max_length")
 
-input_ids = encodings.input_ids[:bsz,:].to(device="cuda:0")
+embed_device = model.model.embed_tokens.weight.device
+input_ids = encodings.input_ids[:bsz,:].to(device=embed_device)
+batches = input_ids.shape[0]
 print(input_ids.shape)
 
 hidden_states = model.model.embed_tokens(input_ids)
 
 attention_mask = None
-position_ids = torch.arange(seq_len, dtype=torch.long, device=hidden_states.device).unsqueeze(0).repeat(bsz, 1)
+position_ids = torch.arange(seq_len, dtype=torch.long, device=hidden_states.device).unsqueeze(0).repeat(batches, 1)
 past_key_value=None
 output_attentions = False
 use_cache = False
 cache_position=None
-position_embeddings = model.model.rotary_emb(hidden_states, position_ids)
 
 
 act_path = os.path.join(args.output_path, "activations")
 os.makedirs(act_path, exist_ok=True)
 
 for i in tqdm(range(len(model.model.layers))):
-    # for greedyopt
-    torch.save(hidden_states, os.path.join(act_path, f"act_{i}.pt"))
-
-
     layer = model.model.layers[i]
     hidden_states = hidden_states.to(layer.self_attn.q_proj.weight.data.device) 
-    hidden_states = layer(hidden_states, attention_mask, position_ids, past_key_value, output_attentions, use_cache, cache_position)[0]
+    layer_kwargs = dict(
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_value,
+        use_cache=use_cache,
+    )
+    if hasattr(model.model, "rotary_emb"):
+        layer_kwargs["position_embeddings"] = model.model.rotary_emb(hidden_states, position_ids)
+    mlp_hist_path = os.path.join(args.output_path, "histograms", f"layer-{i}", "mlp", "histograms.pt")
+    attn_hist_path = os.path.join(args.output_path, "histograms", f"layer-{i}", "self_attn", "histograms.pt")
+    if os.path.isfile(mlp_hist_path) and os.path.isfile(attn_hist_path):
+        hidden_states = layer(**layer_kwargs)[0]
+    else:
+        # for greedyopt
+        torch.save(hidden_states, os.path.join(act_path, f"act_{i}.pt"))
 
-    layer.mlp.activation_module.find_histogram()
-    layer.self_attn.activation_module.find_histogram()
-    layer.mlp.activation_module.save_histogram()
-    layer.self_attn.activation_module.save_histogram()
+        hidden_states = layer(**layer_kwargs)[0]
 
-    del layer.mlp.activation_module.activations
-    del layer.self_attn.activation_module.activations
+        layer.mlp.activation_module.find_histogram()
+        layer.self_attn.activation_module.find_histogram()
+        layer.mlp.activation_module.save_histogram()
+        layer.self_attn.activation_module.save_histogram()
+
+        del layer.mlp.activation_module.activations
+        del layer.self_attn.activation_module.activations
     
     model.model.layers[i] = None
 
