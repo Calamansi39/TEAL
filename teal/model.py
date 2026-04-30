@@ -126,6 +126,10 @@ class SparseModelMixin:
                 patched = _monkeypatch_layer(layer, path=f"{histogram_path}/layer-{i}", grabbing_mode=grab_acts)
                 patched.mlp.layer_idx = i
                 patched.self_attn.layer_idx = i
+                # Newer transformers attention modules do not always expose
+                # hidden_size directly, while TEAL's monkeypatch expects it.
+                if not hasattr(patched.self_attn, "hidden_size"):
+                    patched.self_attn.hidden_size = self.config.hidden_size
                 layers.append(patched)
             else:
                 raise ValueError(f"Unknown layer type: {type(layer)}")

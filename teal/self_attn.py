@@ -52,7 +52,7 @@ def _FA2_forward(
     hidden_states: torch.Tensor,
     attention_mask = None, #: Optional[torch.LongTensor] = None,
     position_ids = None, #: Optional[torch.LongTensor] = None,
-    past_key_value = None, #: Optional[Cache] = None,
+    past_key_values = None, #: Optional[Cache] = None,
     output_attentions = False, #: bool = False,
     use_cache = False, #: bool = False,
     cache_position = None, #: Optional[torch.LongTensor] = None,
@@ -124,10 +124,10 @@ def _FA2_forward(
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
 
-    if past_key_value is not None:
+    if past_key_values is not None:
         # sin and cos are specific to RoPE models; cache_position needed for the static cache
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-        key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
     dropout_rate = self.attention_dropout if self.training else 0.0
 
@@ -207,4 +207,4 @@ def _FA2_forward(
     if not output_attentions:
         attn_weights = None
 
-    return attn_output, attn_weights, past_key_value
+    return attn_output, attn_weights
